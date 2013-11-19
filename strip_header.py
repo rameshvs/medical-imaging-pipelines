@@ -6,14 +6,11 @@ checks (see assertions), but no guarantees.
 """
 from __future__ import print_function
 import sys
-import shutil
 
 import nibabel as nib
 import numpy as np
 
 def unheader(in_file, out_file, permutation, rotate=True):
-    shutil.copy(in_file, out_file)
-    return
     # load in
     nii = nib.load(in_file)
     header = nii.get_header()
@@ -21,8 +18,10 @@ def unheader(in_file, out_file, permutation, rotate=True):
     data = nii.get_data()
     pixdim = header['pixdim'][1:4]
 
-    # permute axes
-    # TODO figure out geometry
+    # permute axes: this is all a hack to remove consistent wrong
+    # orientations of input files (especially ones converted from
+    # analyze from MRIcro).
+    # TODO figure out geometry + consistent way to detect orientation
     # axis_permutation = np.argmax(np.abs(affine[:3,:3]), 1)
     axis_permutation = permutation
     data = data.transpose(axis_permutation)
