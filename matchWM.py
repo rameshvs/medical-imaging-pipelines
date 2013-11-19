@@ -65,6 +65,7 @@ def matchWM(alignedInFile, maskFile, inFile, wmiSrc, outFile):
 
     # save output file
     niiOut.to_filename(outFile)
+    return niiOut
 
 if __name__ == '__main__':
     if len(sys.argv) != 6:

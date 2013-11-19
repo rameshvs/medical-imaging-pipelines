@@ -55,6 +55,7 @@ def padNii(niiFileName, paddedNiiFileName, maskNiiFileName, padAmountMM='30'):
     # save niftis
     newNii.to_filename(paddedNiiFileName)
     newNiiMask.to_filename(maskNiiFileName)
+    return (newNii, newNiiMask)
 
 if __name__ == '__main__':
     if len(sys.argv) not in [4,5]:
