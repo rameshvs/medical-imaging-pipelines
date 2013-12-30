@@ -15,30 +15,42 @@ import time
 
 ATLAS_MODALITY = 't1'
 
-#features_by_modality = {'dwi': ['img', 'roi'], 'flair': ['img', 'wmh_L', 'wmh_R', 'wmh_LR']}
-features_by_modality = {'dwi': ['img'], 'flair': ['img']}
+features_by_modality = {'dwi': ['img', 'roi'], 'flair': ['img', 'wmh_L', 'wmh_R']}
+#features_by_modality = {'dwi': ['img'], 'flair': ['img']}
 mask_collection = {}
 CLOBBER_EXISTING_OUTPUTS = False
 cwd = os.path.dirname(os.path.abspath(__file__))
+
+# Where the files live
+#BASE =            os.path.join(NFS_ROOT, 'projects/stroke/processed_datasets/2013_12_02/site16')
+#BASE =            os.path.join(pb.NFS_ROOT, 'projects/stroke/processed_datasets/2013_05_16')
+# Where the atlas is stored
+ATLAS_BASE =      os.path.join(pb.NFS_ROOT, 'projects/stroke/work/input/atlases/')
+
+ATLAS_SUBJ_NAME = 'buckner61'
 
 if __name__ == '__main__':
 
     ########################
     ### Argument parsing ###
     ########################
-    USAGE = '%s <subj> <smoothness regularization> <field regularization>' % sys.argv[0]
+    USAGE = '%s <subj> <smoothness regularization> <field regularization> <out folder>' % sys.argv[0]
     subj = sys.argv[1]
     # Regularization parameters for ANTS
     regularization = float(sys.argv[2])
     regularization2 = float(sys.argv[3])
-    control = 'control' in sys.argv
-    pad = 'pad' in sys.argv
-    inverse = 'inverse' in sys.argv
 
-    ####################
-    ### Set up atlas ###
-    ####################
-    atlas = pb.Atlas()
+    # where the data lives
+    data_folder = sys.argv[4]
+
+    BASE = os.path.join(pb.NFS_ROOT, 'projects/stroke/processed_datasets', data_folder)
+
+    #############################
+    ### Set up atlas and data ###
+    #############################
+
+    ## Atlas
+    atlas = pb.Atlas(ATLAS_SUBJ_NAME, ATLAS_BASE)
     stroke_atlas_files = {
         'histogram': 'Hist_cut.mat',           # histogram for equalization
         'seg': '_seg.nii.gz',                  # full segmentation
@@ -46,10 +58,13 @@ if __name__ == '__main__':
         'wmh_prior': '_wmh_prior_100.nii.gz',  # prior from averaging subjs
         'wmh_L': '_wmh_L_average.nii.gz',      # prior in left hemisphere
         'wmh_R': '_wmh_R_average.nii.gz',      # prior in right hemisphere
-        'mask': '_fixed_mask_from_seg.nii.gz'} # brain mask
+        'mask': '_fixed_mask_from_seg_binary.nii.gz'} # brain mask
 
     for (name, file_suffix) in stroke_atlas_files.iteritems():
         atlas.add_file(name, file_suffix)
+
+    ## Subject data
+    dataset = pb.Dataset(BASE, atlas)
 
     #############################
     ### Registration pipeline ###
@@ -57,24 +72,25 @@ if __name__ == '__main__':
     t1_modifiers = ''
 
     ###### Fix problems with T1 images caused by use of Analyze format
-    original_t1 = pb.get_file(subj, 't1', 'img', t1_modifiers + '_prep')
+    original_t1 = dataset.get_file(subj, 't1', 'img', t1_modifiers + '_prep')
     unheader = pb.InputOutputShellCommand(
                     "Remove header from T1",
                     cmdName=os.path.join(cwd, 'strip_header.py'),
-                    input=pb.get_original_file(subj,'t1', 'raw'),
+                    input=dataset.get_original_file(subj,'t1', 'raw'),
                     output=original_t1,
-                    other='t1')
+                    other='t1'
+                    )
     t1_modifiers += '_prep'
 
     ###### N4 bias correction of T1.
     n4 = pb.N4Command("N4 bias field correction for T1",
-                    input=pb.get_file(subj, 't1', 'img', t1_modifiers),
-                    output=pb.get_file(subj, 't1', 'img', t1_modifiers + '_bcorr'))
+                    input=dataset.get_file(subj, 't1', 'img', t1_modifiers),
+                    output=dataset.get_file(subj, 't1', 'img', t1_modifiers + '_bcorr'))
     t1_modifiers += '_bcorr'
 
 
     ###### Initial rigid registration
-    fixed = pb.get_file(subj, ATLAS_MODALITY, 'img', t1_modifiers)
+    fixed = dataset.get_file(subj, ATLAS_MODALITY, 'img', t1_modifiers)
     moving = atlas.get_file('img')
     first_stage_metric = 'MI'
     forward_reg_init_affine = pb.ANTSCommand("Initial affine step for "
@@ -95,7 +111,7 @@ if __name__ == '__main__':
                                         mask=False)
 
     init_warp_args = pb.make_warp_kwargs(
-                            pb.get_file(subj, ATLAS_MODALITY, 'img', t1_modifiers),
+                            dataset.get_file(subj, ATLAS_MODALITY, 'img', t1_modifiers),
                             atlas.get_file('img'),
                             [backward_reg_init_affine],
                             ['forward'])
@@ -104,32 +120,36 @@ if __name__ == '__main__':
             "init affine backwards %s -> atlas registration" % ATLAS_MODALITY,
                                     **init_warp_args)
 
+
+    init_warp_mask_args = pb.make_warp_kwargs(
+                            atlas.get_file('mask'),
+                            dataset.get_file(subj, ATLAS_MODALITY, 'img', t1_modifiers),
+                            [backward_reg_init_affine],
+                            ['inverse'])
+
+    forward_reg_warp_f = pb.WarpCommand("Warp atlas mask into subj space "
+            "using init affine backwards %s -> atlas registration" % ATLAS_MODALITY,
+                        **init_warp_mask_args)
+
     ### Intensity matching (can't do histogram equalization)
+    # TODO use more robust mean-shift based mode-matching
+
     match_wm = pb.PyMatchWMCommand("Match white matter intensity values",
                                     alignedInFile=init_warp_args['output'],
                                     maskFile=atlas.get_file('mask'),
                                     inFile=pb.get_file(subj, ATLAS_MODALITY, 'img', t1_modifiers),
                                     wmiSrc=atlas.get_file('img'),
                                     output=pb.get_file(subj, ATLAS_MODALITY, 'img', t1_modifiers + '_matchwm'))
+
     t1_modifiers += '_matchwm'
 
     t1_modifiers_this = t1_modifiers
 
-    if pad:
-        padder = pb.PyPadCommand("Pad preprocessed T1 before registration",
-                                input=pb.get_file(subj, ATLAS_MODALITY, 'img', t1_modifiers),
-                                output=pb.get_file(subj, ATLAS_MODALITY, 'img', t1_modifiers + '_pad'),
-                                out_mask=pb.get_file(subj, ATLAS_MODALITY, 'img', t1_modifiers + '_padmask_seg'))
-        t1_modifiers_this += '_pad'
-        reg_mask = pb.get_file(subj, ATLAS_MODALITY, 'img', t1_modifiers_this + 'mask_seg')
-    else:
-        reg_mask = False
-
-    # moving = pb.get_file(subj, modality, 'img', modifiers[modality])
+    # moving = dataset.get_file(subj, modality, 'img', modifiers[modality])
     second_stage_metric = 'CC'
     second_stage_radiusBins = 4
 
-    subject_img = pb.get_file(subj, ATLAS_MODALITY, 'img', t1_modifiers_this)
+    subject_img = dataset.get_file(subj, ATLAS_MODALITY, 'img', t1_modifiers_this)
 
     ###### Final atlas -> subject registration
     forward_reg_full = pb.ANTSCommand("Forward atlas -> %s registration with "
@@ -139,8 +159,8 @@ if __name__ == '__main__':
                                     fixed=subject_img,
                                     metric=second_stage_metric,
                                     radiusBins=second_stage_radiusBins,
-                                    mask=reg_mask,
-                                    regularization='Gauss[%0.1f,%0.1f]' % (regularization,regularization2),
+                                    regularization='Gauss[%0.3f,%0.3f]' % (regularization,regularization2),
+                                    #regularization='Gauss[%0.1f,%0.1f]' % (regularization,regularization2),
                                     method='201x201x201',
                                     init=forward_reg_init_affine.affine)
 
@@ -172,39 +192,40 @@ if __name__ == '__main__':
     ###### Rigid ANTS registration DWI/FLAIR --> T1
     reg_to_t1 = {} # dict containing the ANTSCommand objects by modality
     for modality in ['flair', 'dwi']:
-        if not os.path.exists(pb.get_original_file(subj, modality, 'img')):
+        if not os.path.exists(dataset.get_original_file(subj, modality, 'img')):
             # Quit if the subject is missing data. TODO support partial script execution
             continue
         for feature in features_by_modality[modality]:
             if feature != 'wmh_LR':
                 modifiers = ''
                 unheader = pb.InputOutputShellCommand(
-                                "Remove header from %s %s to fix analyze issues" % (modality,feature),
-                                cmdName=os.path.join(cwd, 'strip_header.py'),
-                                input=pb.get_original_file(subj,modality, feature),
-                                output=pb.get_file(subj, modality, feature, modifiers + '_prep'),
-                                other=modality)
+                                "Don't remove header from %s %s to fix analyze issues" % (modality,feature),
+                                #cmdName=os.path.join(cwd, 'strip_header.py'),
+                                cmdName='cp',
+                                input=dataset.get_original_file(subj,modality, feature),
+                                output=dataset.get_file(subj, modality, feature, modifiers + '_prep'),
+                                )
                 modifiers = '_prep'
 
                 pad = pb.PyPadCommand("Pad %s %s" % (modality, feature),
-                                    input=pb.get_file(subj, modality, feature, modifiers),
-                                    #input=pb.get_original_file(subj,modality, feature),
-                                    output=pb.get_file(subj, modality, feature, modifiers+'_pad'),
-                                    out_mask=pb.get_file(subj, modality, feature, modifiers+'_padmask_seg'))
+                                    input=dataset.get_file(subj, modality, feature, modifiers),
+                                    #input=dataset.get_original_file(subj,modality, feature),
+                                    output=dataset.get_file(subj, modality, feature, modifiers+'_pad'),
+                                    out_mask=dataset.get_file(subj, modality, feature, modifiers+'_padmask_seg'))
         modifiers = '_prep_pad'
 
         reg_to_t1_init = pb.ANTSCommand("Rigid intrasubject/multimodal "
                 "registration of %s to T1: initialize w/o mask" % modality,
-                                moving=pb.get_file(subj, modality, 'img', modifiers),
-                                fixed=pb.get_file(subj, 't1', 'img', t1_modifiers_this),
+                                moving=dataset.get_file(subj, modality, 'img', modifiers),
+                                fixed=dataset.get_file(subj, 't1', 'img', t1_modifiers_this),
                                 metric='MI',
                                 regularization='Gauss[4.5,0]',
                                 method='rigid')
 
         reg_to_t1[modality] = pb.ANTSCommand("Rigid intrasubject/multimodal "
                 "registration of %s to T1: continue with mask" % modality,
-                                        moving=pb.get_file(subj, modality, 'img', modifiers),
-                                        fixed=pb.get_file(subj, 't1', 'img', t1_modifiers_this),
+                                        moving=dataset.get_file(subj, modality, 'img', modifiers),
+                                        fixed=dataset.get_file(subj, 't1', 'img', t1_modifiers_this),
                                         metric='MI',
                                         regularization='Gauss[4.5,0]',
                                         method='rigid',
@@ -213,8 +234,8 @@ if __name__ == '__main__':
 
         ### Warp subject stuff into common space for spatial analysis
         for feature in features_by_modality[modality]:
-            warp_to_t1_args = pb.make_warp_kwargs(pb.get_file(subj, modality, feature, modifiers),
-                                                        pb.get_file(subj, 't1', 'img', t1_modifiers_this),
+            warp_to_t1_args = pb.make_warp_kwargs(dataset.get_file(subj, modality, feature, modifiers),
+                                                        dataset.get_file(subj, 't1', 'img', t1_modifiers_this),
                                                         [reg_to_t1[modality]],
                                                         ['forward'])
 
@@ -223,7 +244,7 @@ if __name__ == '__main__':
                                         **warp_to_t1_args)
 
 
-            warp_to_atlas_args = pb.make_warp_kwargs(pb.get_file(subj, modality, feature, modifiers),
+            warp_to_atlas_args = pb.make_warp_kwargs(dataset.get_file(subj, modality, feature, modifiers),
                                                atlas.get_file('img'),
                                                [reg_to_t1[modality], forward_reg_full],
                                                ['forward', 'inverse'])
@@ -236,7 +257,7 @@ if __name__ == '__main__':
         for atlas_feature in ['img', 'mask', 'seg', 'wmh_mask', 'wmh_prior', 'wmh_L', 'wmh_R']:
 
             warp_from_atlas_args = pb.make_warp_kwargs(atlas.get_file(atlas_feature),
-                                                    pb.get_file(subj, modality, 'img', modifiers),
+                                                    dataset.get_file(subj, modality, 'img', modifiers),
                                                     [forward_reg_full, reg_to_t1[modality]],
                                                     ['forward', 'inverse'])
 
@@ -255,8 +276,8 @@ if __name__ == '__main__':
 
 
         for feature in features_by_modality['flair']:
-            moving = pb.get_file(subj, 'flair', feature, '_prep_pad')
-            reference = pb.get_file(subj, 'dwi', 'img', '_prep_pad')
+            moving = dataset.get_file(subj, 'flair', feature, '_prep_pad')
+            reference = dataset.get_file(subj, 'dwi', 'img', '_prep_pad')
 
             warp_flair_dwi_args = pb.make_warp_kwargs(moving,
                                                    reference,
@@ -267,8 +288,8 @@ if __name__ == '__main__':
                                             **warp_flair_dwi_args)
 
         for feature in features_by_modality['dwi']:
-            moving = pb.get_file(subj, 'dwi', feature, '_prep_pad')
-            reference = pb.get_file(subj, 'flair', 'img', '_prep_pad')
+            moving = dataset.get_file(subj, 'dwi', feature, '_prep_pad')
+            reference = dataset.get_file(subj, 'flair', 'img', '_prep_pad')
 
             warp_dwi_flair_args = pb.make_warp_kwargs(moving,
                                                    reference,
@@ -279,25 +300,25 @@ if __name__ == '__main__':
                                             **warp_dwi_flair_args)
 
         if 'roi' in features_by_modality['dwi']:
-            warp_flair_dwi_args = pb.make_warp_kwargs(pb.get_file(subj, 'dwi', 'roi', modifiers),
-                                                   pb.get_file(subj, 'flair', 'img', modifiers),
+            warp_flair_dwi_args = pb.make_warp_kwargs(dataset.get_file(subj, 'dwi', 'roi', modifiers),
+                                                   dataset.get_file(subj, 'flair', 'img', modifiers),
                                                    [reg_to_t1['dwi'], reg_to_t1['flair']],
                                                    ['forward', 'inverse'])
             warp_dwi_to_flair = pb.WarpCommand("Warp DWI ROI (stroke) into FLAIR space",
                                             useNN=False,
                                             **warp_flair_dwi_args)
 
-    # # warp segmentations back into atlas space
-    # if 'flair' in reg_to_t1:
-    #     moving = pb.get_file(subj, 'flair', 'wmh', '_CALL_prep_pad-MATLAB_WM_corr')
-    #     reference = atlas.get_file('img')
+    # warp segmentations back into atlas space
+    if 'flair' in reg_to_t1:
+        moving = dataset.get_file(subj, 'flair', 'wmh', '_CALL_prep_pad-MATLAB_WM_corr')
+        reference = atlas.get_file('img')
 
-    #     warp_wmh_back_args = pb.make_warp_kwargs(moving, reference, [reg_to_t1['flair'], forward_reg_full], ['forward', 'inverse'])
-    #     warp_wmh_back = pb.WarpCommand("Warp WMH back into atlas space", useNN=True, **warp_wmh_back_args)
+        warp_wmh_back_args = pb.make_warp_kwargs(moving, reference, [reg_to_t1['flair'], forward_reg_full], ['forward', 'inverse'])
+        warp_wmh_back = pb.WarpCommand("Warp WMH back into atlas space", useNN=True, **warp_wmh_back_args)
 
-    for path in [os.path.join(pb.BASE,subj,'images'),
-            os.path.join(pb.BASE,subj,'images','reg'),
-            pb.get_sge_folder(subj)]:
+    for path in [os.path.join(BASE,subj,'images'),
+            os.path.join(BASE,subj,'images','reg'),
+            dataset.get_sge_folder(subj)]:
         try:
             os.mkdir(path)
         except:
@@ -306,14 +327,15 @@ if __name__ == '__main__':
     ### Generate script file and SGE qsub file
     time.sleep(1) # sleep so that timestamps don't clash
     timestamp = datetime.datetime.now().strftime('%y%m%d-%H%M%S')
-    out_script = os.path.join(pb.get_sge_folder(subj), 'pipeline.%s.sh' % timestamp)
+    out_script = os.path.join(dataset.get_sge_folder(subj), 'pipeline.%s.sh' % timestamp)
     pb.Command.generate_code(out_script, clobber_existing_outputs=CLOBBER_EXISTING_OUTPUTS)
 
     ## Prep for SGE
     out_qsub = out_script + '.qsub'
-    os.environ['SGE_LOG_PATH'] = pb.get_sge_folder(subj)
+    os.environ['SGE_LOG_PATH'] = dataset.get_sge_folder(subj)
     with open(out_qsub,'w') as out_qsub_file:
         subprocess.call([pb.QSUB_RUN, '-c', out_script], stdout=out_qsub_file)
 
     print(out_qsub)
     subprocess.call([pb.QSUB, out_qsub])
+

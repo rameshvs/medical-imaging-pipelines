@@ -8,11 +8,19 @@
 # For questions, please contact {rameshvs,adalca}@csail.mit.edu.
 
 from __future__ import print_function
+import re
 import os
+import numpy as np
 
+import json
 
 THIS_DIR = os.path.dirname(os.path.realpath(__file__))
-# Where will your data be stored?
+
+##############################################
+### System paths (you should change these) ###
+##############################################
+
+# On our system, everything lives on an NFS drive.
 NFS_ROOT = '/data/vision/polina/'
 # ANTS build directory
 ANTSPATH =        os.path.join(NFS_ROOT, 'shared_software/ANTS/build/bin/')
@@ -20,21 +28,14 @@ ANTSPATH =        os.path.join(NFS_ROOT, 'shared_software/ANTS/build/bin/')
 MCC_BINARY_PATH = os.path.join(NFS_ROOT, 'projects/stroke/bin/MCC/')
 # Matlab compiler runtime location
 MCR =             os.path.join(NFS_ROOT, 'shared_software/MCR/v717/')
-
 # Script to generate a file for submitting with QSUB
 QSUB_RUN =        os.path.join(THIS_DIR,'qsub-run')
 
-# Where the files live
-BASE =            os.path.join(NFS_ROOT, 'projects/stroke/processed_datasets/2013_11_18')
-# Where the atlas is stored
-ATLAS_BASE =      os.path.join(NFS_ROOT, 'projects/stroke/work/input/atlases/')
-
-# Requires SGE to run
+# Requires SGE to run in batch mode
 QSUB = 'qsub'
 # image type / file extension: only .nii.gz is currently supported!!
 STANDARD_EXTENSION = '.nii.gz'
 
-ATLAS_SUBJ_NAME = 'buckner61'
 
 ################################################################################
 ### Utility I/O stuff (handles all file naming conventions: adjust to taste) ###
@@ -48,20 +49,19 @@ def get_filebase(filename):
     base_ext = filename.split(os.path.sep)[-1]
     return base_ext.split('.')[0]
 
-def get_sge_folder(subj):
-    """ Returns the subfolder of the subject with SGE logs """
-    return os.path.join(BASE, subj, 'sge_new')
-
 def select_non_atlas(moving, fixed):
-    """ Returns whichever of moving/fixed isn't the atlas image. """
-    if ATLAS_SUBJ_NAME not in fixed and \
-            ATLAS_SUBJ_NAME in moving:
+    """
+    Returns whichever of moving/fixed isn't the atlas image.
+    """
+    # TODO this is kind of a hack: get rid of this and do things better
+    if 'atlases' not in fixed and \
+            'atlases' in moving:
         non_atlas = fixed # atlas -> subj
-    elif ATLAS_SUBJ_NAME not in moving and \
-            ATLAS_SUBJ_NAME in fixed:
+    elif 'atlases' not in moving and \
+            'atlases' in fixed:
         non_atlas = moving # subj -> atlas
-    elif ATLAS_SUBJ_NAME not in fixed and \
-            ATLAS_SUBJ_NAME not in moving:
+    elif 'atlases' not in fixed and \
+            'atlases' not in moving:
         assert os.path.dirname(fixed) == os.path.dirname(moving), \
                 "Found registration between two non-atlas images from"\
                 "different folders"
@@ -70,23 +70,39 @@ def select_non_atlas(moving, fixed):
         raise ValueError("Shouldn't have more than one atlas image in a registration")
     return os.path.dirname(non_atlas)
 
+class Dataset(object):
+    """
+    Class representing your data. Has a range of features from simple to
+    elaborate; you can use as much as is useful to you.
 
-def get_file(subj, modality, feature, modifiers=''):
-    spec = {'subj': subj, 'modality': modality, 'feature': feature, 'modifiers': modifiers}
+    The parameter `feature` refers to a particular image: in our dataset,
+    it was usually either "image" or "roi" (region of interest, referring
+    to a manual or automatically segmented region).
+    """
+    def __init__(self, base, atlas):
+        self.base = base
+        self.atlas = atlas
 
-    IMAGE_TEMPLATE = os.path.join(BASE , '%(subj)s/images/%(subj)s_%(modality)s_%(feature)s%(modifiers)s.nii.gz')
+    def get_sge_folder(self, subj):
+        """ Returns the subfolder of the subject with SGE logs """
+        return os.path.join(self.base, subj, 'sge_new')
 
-    return IMAGE_TEMPLATE % spec
+    def get_file(self, subj, modality, feature, modifiers=''):
+        spec = {'subj': subj, 'modality': modality, 'feature': feature, 'modifiers': modifiers}
 
-def get_original_file(subj, modality, feature):
-    if feature == 'img':
-        feature = 'raw'
-    ORIGINAL_TEMPLATE = os.path.join(BASE , '%(subj)s/original/%(modality)s_1/%(subj)s_%(modality)s_%(feature)s.nii.gz')
-    spec = {'subj': subj, 'modality': modality, 'feature': feature}
-    # ORIGINAL_TEMPLATE = os.path.join(BASE , '/%(subj)s/%(modality)s.nii.gz')
-    # spec = {'subj': subj, 'modality': modality}
+        template = os.path.join(self.base, '{subj}/images/{subj}_{modality}_{feature}{modifiers}.nii.gz')
 
-    return ORIGINAL_TEMPLATE % spec
+        return template.format(**spec)
+
+    def get_original_file(self, subj, modality, feature):
+        if feature == 'img':
+            feature = 'raw'
+        template = os.path.join(self.base , '{subj}/original/{modality}_1/{subj}_{modality}_{feature}.nii.gz')
+        spec = {'subj': subj, 'modality': modality, 'feature': feature}
+        # ORIGINAL_TEMPLATE = os.path.join(self.base , '/%(subj)s/%(modality)s.nii.gz')
+        # spec = {'subj': subj, 'modality': modality}
+
+        return template.format(**spec)
 
 class Atlas(object):
     """
@@ -96,7 +112,7 @@ class Atlas(object):
 
     suffixes = {'img': '.nii.gz'}
 
-    def __init__(self, atlas_subj='buckner61', atlas_location=ATLAS_BASE):
+    def __init__(self, atlas_subj, atlas_location):
         self.atlas_subj = atlas_subj
         self.atlas_location = atlas_location
 
@@ -106,8 +122,9 @@ class Atlas(object):
 
     def get_file(self, name):
         """ Returns the filename for some registered file. """
-        return os.path.join(self.atlas_location, '%(atlas_subj)s%(suffix)s' % \
-            {'suffix': self.suffixes[name], 'atlas_subj': self.atlas_subj})
+        return os.path.join(self.atlas_location,
+                            '{atlas_subj}{suffix}'.format(
+                                suffix=self.suffixes[name], atlas_subj=self.atlas_subj))
 
 def modify_filename(filename, modifier):
     """ Takes ('/a/b/foo.nii.gz', '_pad') and returns '/a/b/foo_pad.nii.gz' """
@@ -119,14 +136,20 @@ def modify_filename(filename, modifier):
 ###############################################################################
 class Command(object):
     """
-    Represents a command/task that has to be run.
-    When creating one, make sure to call Command.__init__ with
-    comment and output!
+    Represents a command/task that has to be run.  When creating one, make sure
+    to call Command.__init__ with comment and output!
+
+    If your command produces any outputs not given by the output keyword
+    argument, you should set outfiles within your command.
     """
     all_commands = [] # Static list of all command objects
 
     @classmethod
-    def generate_code(cls, command_file, clobber_existing_outputs=False):
+    def reset(cls):
+        cls.all_commands = []
+    @classmethod
+    def generate_code(cls, command_file, clobber_existing_outputs=False,
+                      json_file=None):
         """
         Writes code to perform all created commands. Commands are run in the
         order they were created; there are no dependency-based reorderings.
@@ -135,6 +158,7 @@ class Command(object):
         clobber_existing_outputs: whether or not to rerun commands whose
         outputs already exist
         """
+        # TODO incorporate dependencies
         with open(command_file, 'w') as f:
             f.write('#!/usr/bin/env bash\n')
             f.write('set -e\n\n')
@@ -146,17 +170,53 @@ class Command(object):
                     f.write('# *** Skipping ' + command.comment + '\n\n\n\n')
         os.chmod(command_file, 0775)
 
+
+
     def __init__(self, comment='', **kwargs):
-        self.outfiles = [kwargs['output']]
+        if not hasattr(self, 'outfiles'):
+            self.outfiles = [kwargs['output']]
         self.comment = comment
 
         self.cmd = self.cmd % kwargs
+
+        self.command_id = len(Command.all_commands)
         Command.all_commands.append(self) # order is very important here
+
+        self.parameters = kwargs
+
+        # Tracking of input/output relationships between commands.
+        # TODO use this to track files, etc.
+        inputs = []
+        self.inputs = []
+        # TODO make this much better
+        for (k, v) in self.parameters.items():
+            if k == 'cmdName':
+                continue
+            if type(v) is str:
+                # split on non-escaped spaces (since escaped spaces could be
+                # filenames)
+                inputs.extend(re.split(r'(?<!\\)\s+', v))
+            elif type(v) is list or type(v) is tuple:
+                inputs.extend(v)
+        for v in inputs:
+            if type(v) is str and has_valid_path(v):
+                self.inputs.append(v)
+
+        # print(self.inputs)
+        # print('\n\n')
+        self.inputs = set(self.inputs).difference(self.outfiles)
 
     def check_outputs(self):
         """ Checks if outputs are already there (True if they are). Warning: not thread-safe """
         return len(filter(os.path.exists, self.outfiles)) == len(self.outfiles)
 
+def is_original_file(filename):
+    # TODO fix this awful hack
+    return ('original' in filename or 'atlas' in filename or 'CALL' in filename) and \
+            not (filename.endswith('.sh') or filename.endswith('.py'))
+
+def has_valid_path(filename):
+    return os.path.isdir(os.path.dirname(filename))
 ###################################################
 # Commands for using binaries that ship with ANTS #
 ###################################################
@@ -176,7 +236,7 @@ class ANTSCommand(Command):
         metric : An ANTS similarity metric. Tested/supported options are
                  'CC' (corr. coeff.) and 'MI' (mutual information).
                  Other ANTS metrics might work but are untested.
-        regularization : an ANTS regularization type. The tested/supported 
+        regularization : an ANTS regularization type. The tested/supported
                          option is 'Gauss'
         mask : a mask (binary volume file) over which to compute the metric
                for registration
@@ -307,7 +367,7 @@ def make_warp_kwargs(moving, reference, reg_sequence, invert_sequence):
             warp_string = ants.forward_warp_string
         command_sequence = warp_string + command_sequence
     base_folder = select_non_atlas(moving, reference)
-    a = '{moving}_IN_{descr}_{reference}s-.nii.gz'.format(
+    a = '{moving}_IN_{descr}_{reference}-.nii.gz'.format(
             moving=get_filebase(moving),
             descr=transform_infix,
             reference=get_filebase(reference))
@@ -339,7 +399,7 @@ class WarpCommand(Command):
 
         Command.__init__(self, comment, **kwargs)
 
-class N4Command(Command): 
+class N4Command(Command):
     def __init__(self, comment='', **kwargs):
         """
         Creates a command for N4 bias field correction.
@@ -397,7 +457,7 @@ class PyMatchWMCommand(Command):
         wmiSrc : atlas file or a numeric string w/the average white matter intensity
         outFile: output
         """
-        py = os.path.join(THIS_DIR, 'tools', 'matchWM.py')
+        py = os.path.join(THIS_DIR, 'matchWM.py')
         self.cmd = py + ' %(alignedInFile)s %(maskFile)s %(inFile)s %(wmiSrc)s %(output)s'
         Command.__init__(self, comment, **kwargs)
 
@@ -412,8 +472,9 @@ class PyPadCommand(Command):
         input, output: input and padded output volumes
         out_mask: output mask (binary image) marking which regions weren't padding
         """
-        py = os.path.join(THIS_DIR, 'tools', 'padNii.py')
+        py = os.path.join(THIS_DIR, 'padNii.py')
         self.cmd = py + ' %(input)s %(output)s %(out_mask)s'
+        self.outfiles = [kwargs['output'], kwargs['out_mask']]
         Command.__init__(self, comment, **kwargs)
 
 ############################################
@@ -449,7 +510,7 @@ class MCCHistEqCommand(MCCCommand):
 class MCCMatchWMCommand(MCCCommand):
     def __init__(self, comment='', **kwargs):
         kwargs['matlabName'] = 'matchWM'
-        self.cmd = self.prefix + '%(alignedInFile)s %(maskFile)s %(inFile)s %(wmiSrc)s %(output)s'
+        self.cmd = self.prefix + '%(inFile)s %(maskFile)s %(intensity)s %(output)s'
         Command.__init__(self, comment, **kwargs)
 
 
