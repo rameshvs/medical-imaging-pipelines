@@ -1,7 +1,7 @@
 # Medical Imaging Pipelines
 
 This code provides a simple framework for building pipelines for medical
-imaging processing tasks.
+image processing tasks.
 
 ## Requirements
 
@@ -19,7 +19,7 @@ Using MATLAB-compiled commands (MCC) requires the [MATLAB Compiler Runtime
 For an example, see `regpipe.py`, which implements the registration
 pipeline described in the paper:
 
-Quantification and Analaysis of Large Multimodal Clinical Image Studies:
+Quantification and Analysis of Large Multimodal Clinical Image Studies:
 Application to Stroke by Sridharan et al.
 
 To construct your own pipeline, you can use this script as a baseline
