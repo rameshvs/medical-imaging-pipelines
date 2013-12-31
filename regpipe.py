@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # This script implements the registration pipeline described in the paper:
 #
-# Quantification and Analaysis of Large Multimodal Clinical Image Studies:
+# Quantification and Analysis of Large Multimodal Clinical Image Studies:
 # Application to Stroke, by Sridharan, Dalca et al.
 #
 # For questions, please contact {rameshvs,adalca}@csail.mit.edu.
