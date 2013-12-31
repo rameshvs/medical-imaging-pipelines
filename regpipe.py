@@ -41,9 +41,9 @@ if __name__ == '__main__':
     regularization2 = float(sys.argv[3])
 
     # where the data lives
-    data_folder = sys.argv[4]
+    data_subfolder = sys.argv[4]
 
-    BASE = os.path.join(pb.NFS_ROOT, 'projects/stroke/processed_datasets', data_folder)
+    BASE = os.path.join(pb.NFS_ROOT, 'projects/stroke/processed_datasets', data_subfolder)
 
     #############################
     ### Set up atlas and data ###

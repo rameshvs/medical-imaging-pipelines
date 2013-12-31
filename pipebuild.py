@@ -21,7 +21,7 @@ THIS_DIR = os.path.dirname(os.path.realpath(__file__))
 ##############################################
 
 # On our system, everything lives on an NFS drive.
-NFS_ROOT = '/data/vision/polina/'
+NFS_ROOT = '/path/to/NFS/drive/'
 # ANTS build directory
 ANTSPATH =        os.path.join(NFS_ROOT, 'shared_software/ANTS/build/bin/')
 # Where MCC binaries are stored
