@@ -6,7 +6,9 @@
 #
 # For questions, please contact {rameshvs,adalca}@csail.mit.edu.
 
+import tracking
 import pipebuild as pb
+
 import os
 import sys
 import subprocess
@@ -137,9 +139,9 @@ if __name__ == '__main__':
     match_wm = pb.PyMatchWMCommand("Match white matter intensity values",
                                     alignedInFile=init_warp_args['output'],
                                     maskFile=atlas.get_file('mask'),
-                                    inFile=pb.get_file(subj, ATLAS_MODALITY, 'img', t1_modifiers),
+                                    inFile=dataset.get_file(subj, ATLAS_MODALITY, 'img', t1_modifiers),
                                     wmiSrc=atlas.get_file('img'),
-                                    output=pb.get_file(subj, ATLAS_MODALITY, 'img', t1_modifiers + '_matchwm'))
+                                    output=dataset.get_file(subj, ATLAS_MODALITY, 'img', t1_modifiers + '_matchwm'))
 
     t1_modifiers += '_matchwm'
 
@@ -325,7 +327,7 @@ if __name__ == '__main__':
             pass
 
     ### Generate script file and SGE qsub file
-    time.sleep(1) # sleep so that timestamps don't clash
+    time.sleep(1) # sleep so that timestamps don't clash, SGE isn't overloaded
     timestamp = datetime.datetime.now().strftime('%y%m%d-%H%M%S')
     out_script = os.path.join(dataset.get_sge_folder(subj), 'pipeline.%s.sh' % timestamp)
     pb.Command.generate_code(out_script, clobber_existing_outputs=CLOBBER_EXISTING_OUTPUTS)
