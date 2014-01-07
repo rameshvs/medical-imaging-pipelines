@@ -326,6 +326,9 @@ if __name__ == '__main__':
         except:
             pass
 
+    ### Generate JSON file describing pipeline
+    tracker = tracking.Tracker(pb.Command.all_commands)
+    tracker.write_pipeline_to_json(os.path.join(dataset.get_sge_folder(subj), 'pipeline.json'))
     ### Generate script file and SGE qsub file
     time.sleep(1) # sleep so that timestamps don't clash, SGE isn't overloaded
     timestamp = datetime.datetime.now().strftime('%y%m%d-%H%M%S')
