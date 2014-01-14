@@ -10,9 +10,6 @@
 from __future__ import print_function
 import re
 import os
-import numpy as np
-
-import json
 
 THIS_DIR = os.path.dirname(os.path.realpath(__file__))
 
@@ -21,14 +18,14 @@ THIS_DIR = os.path.dirname(os.path.realpath(__file__))
 ##############################################
 
 # On our system, everything lives on an NFS drive.
-NFS_ROOT = '/path/to/NFS/drive/'
+NFS_ROOT = '/data/vision/polina'
 # ANTS build directory
 ANTSPATH =        os.path.join(NFS_ROOT, 'shared_software/ANTS/build/bin/')
 # Where MCC binaries are stored
 MCC_BINARY_PATH = os.path.join(NFS_ROOT, 'projects/stroke/bin/MCC/')
 # Matlab compiler runtime location
 MCR =             os.path.join(NFS_ROOT, 'shared_software/MCR/v717/')
-# Script to generate a file for submitting with QSUB
+# Script to generate a file for submitting with SGE QSUB
 QSUB_RUN =        os.path.join(THIS_DIR,'qsub-run')
 
 # Requires SGE to run in batch mode
@@ -62,6 +59,8 @@ def select_non_atlas(moving, fixed):
         non_atlas = moving # subj -> atlas
     elif 'atlases' not in fixed and \
             'atlases' not in moving:
+        # while this is a reasonable thing to want to do, we just don't
+        # support it yet
         assert os.path.dirname(fixed) == os.path.dirname(moving), \
                 "Found registration between two non-atlas images from"\
                 "different folders"
@@ -79,30 +78,40 @@ class Dataset(object):
     it was usually either "image" or "roi" (region of interest, referring
     to a manual or automatically segmented region).
     """
-    def __init__(self, base, atlas):
+    # TODO make an example here with the freesurfer format
+    def __init__(self, base, atlas, original_template, processing_template):
         self.base = base
         self.atlas = atlas
+        self.original_template = original_template
+        self.processing_template = processing_template
 
-    def get_sge_folder(self, subj):
-        """ Returns the subfolder of the subject with SGE logs """
-        return os.path.join(self.base, subj, 'sge_new')
-
-    def get_file(self, subj, modality, feature, modifiers=''):
-        spec = {'subj': subj, 'modality': modality, 'feature': feature, 'modifiers': modifiers}
-
-        template = os.path.join(self.base, '{subj}/images/{subj}_{modality}_{feature}{modifiers}.nii.gz')
-
-        return template.format(**spec)
+    def get_log_folder(self, subj):
+        """
+        Returns the subfolder of the subject with logs (SGE, metadata, etc)
+        """
+        return os.path.join(self.base, subj, 'logs')
 
     def get_original_file(self, subj, modality, feature):
+        """
+        Returns the specified file. Meant to be used for files that are inputs to the pipeline.
+        """
         if feature == 'img':
             feature = 'raw'
-        template = os.path.join(self.base , '{subj}/original/{modality}_1/{subj}_{modality}_{feature}.nii.gz')
+        #template = os.path.join(self.base , '{subj}/original/{modality}_1/{subj}_{modality}_{feature}.nii.gz')
         spec = {'subj': subj, 'modality': modality, 'feature': feature}
-        # ORIGINAL_TEMPLATE = os.path.join(self.base , '/%(subj)s/%(modality)s.nii.gz')
-        # spec = {'subj': subj, 'modality': modality}
 
-        return template.format(**spec)
+        return self.original_template.format(**spec)
+
+    def get_file(self, subj, modality, feature, modifiers=''):
+        """
+        Returns the specified file. Meant to be used for intermediate files in the processing
+        pipeline.
+        """
+        spec = {'subj': subj, 'modality': modality, 'feature': feature, 'modifiers': modifiers}
+        return self.processing_template.format(**spec)
+
+        #template = os.path.join(self.base, '{subj}/images/{subj}_{modality}_{feature}{modifiers}.nii.gz')
+
 
 class Atlas(object):
     """
@@ -254,9 +263,9 @@ class ANTSCommand(Command):
             'ANTS 3 ' + \
             '-m %(metric)s[%(fixed)s,%(moving)s,1,%(radiusBins)d] ' + \
             '-t Syn[0.25] ' + \
-            '-r %(regularization)s ' + \
             '-o %(output)s ' + \
-            '--number-of-affine-iterations 10000x10000x10000x10000x10000'
+            '--number-of-affine-iterations 100x100x100'
+            #'--number-of-affine-iterations 10000x10000x10000x10000x10000'
         outfiles = ['Affine.txt']
         if 'method' in kwargs:
             if kwargs['method'] in ['affine', 'rigid']:
@@ -268,7 +277,7 @@ class ANTSCommand(Command):
                     self.method_name = 'AFFINE'
             else:
                 outfiles += ['InverseWarp' + STANDARD_EXTENSION, 'Warp' + STANDARD_EXTENSION]
-                self.cmd += ' -i %(method)s';
+                self.cmd += ' -i %(method)s -r %(regularization)s '
                 # Convert to a form that's appropriate for string naming:
                 # "Gauss[4.5,0] becomes "GAUSS_45_0"
                 sanitized_regularization = kwargs['regularization'].replace('[','_')\
@@ -337,25 +346,9 @@ class ANTSCommand(Command):
 
 def make_warp_kwargs(moving, reference, reg_sequence, invert_sequence):
     """
-    Creates a dictionary of arguments for a warp command using the *ordered*
-    sequence of registration command objects provided.
-
-    invert_sequence is a list of strings corresponding to the warps in
-    reg_sequence: each one should be 'inverse' or 'forward'
-
-    Sample usage:
-    -------------
-    regA = ANTSCommand("Register 1 to 2", moving=img1, fixed=img2, ...)
-    regB = ANTSCommand("Register 2 to 3", moving=img2, fixed=img3, ...)
-
-    # To warp 1 to 3 using these registrations:
-    args = make_warp_kwargs(img1, img3, [regA, regB], ['forward', 'forward'])
-    warp_1to3 = WarpCommand("Warp 1 to 3", **args)
-
-    # To warp 3 to 1 using these registrations
-    args = make_warp_kwargs(img3, img1, [regB, regA], ['inverse', 'inverse'])
-    warp_3to1 = WarpCommand("Warp 3 to 1", **args)
+    DEPRECATED. See ANTSWarpCommand.make_from_registration_sequence instead.
     """
+    raise DeprecationWarning
     transform_infix = ''
     command_sequence = ''
     for (ants, invert) in zip(reg_sequence, invert_sequence):
@@ -376,10 +369,83 @@ def make_warp_kwargs(moving, reference, reg_sequence, invert_sequence):
     return {'moving': moving, 'reference': reference,
             'output': output, 'transforms': command_sequence}
 
-class WarpCommand(Command):
+class ANTSWarpCommand(Command):
+    """
+    Command representing an ANTS warp. Unlike most other commands, the most
+    convenient way to make these is using the class methods
+    make_from_single_registration and make_from_registration_sequence.
+    """
+
+    @classmethod
+    def make_from_single_registration(cls, comment, moving, reference,
+            registration, inversion='forward'):
+        """
+        Creates a warp command from a single registration. See
+        `make_from_registration_sequence' for more details.
+
+        moving and reference are filenames; registration is an ANTSCommand
+        object, and inversion is a string ('forward' or 'inverse', default
+        'forward') describing which way to warp.
+        """
+        return cls.make_from_registration_sequence(comment, moving, reference,
+                [registration], [inversion])
+
+    @classmethod
+    def make_from_registration_sequence(cls, comment, moving, reference,
+            reg_sequence, inversion_sequence, **kwargs):
+        """
+        Creates a warp command using the *ordered* sequence of registration
+        command objects provided.
+
+        inversion_sequence is a list of strings corresponding to the
+        registration command objects in reg_sequence: each one should be
+        'inverse' or 'forward'
+
+        kwargs contains extra arguments to the constructor (such as useNN)
+
+        See make_from_single_registration for a simpler interface when
+        multiple warps aren't needed.
+
+        Sample usage:
+        -------------
+        regA = ANTSCommand("Register 1 to 2", moving=img1, fixed=img2, ...)
+        regB = ANTSCommand("Register 2 to 3", moving=img2, fixed=img3, ...)
+
+        # To warp 1 to 3 using these registrations:
+        warp_1to3 = ANTSWarpCommand.make_from_registration(img1, img3,
+                        [regA, regB], ['forward', 'forward'])
+
+        # To warp 3 to 1 using these registrations
+        warp_3to1 = ANTSWarpCommand.make_from_registration(img3, img1,
+                        [regB, regA], ['inverse', 'inverse'])
+        """
+        transform_infix = ''
+        command_sequence = ''
+        # construct warps in the format that ANTS wants them
+        for (ants, invert) in zip(reg_sequence, inversion_sequence):
+            transform_infix += ants.transform_infix
+
+            if invert == 'inverse':
+                warp_string = ants.backward_warp_string
+            elif invert == 'forward':
+                warp_string = ants.forward_warp_string
+            command_sequence = warp_string + command_sequence
+        base_folder = select_non_atlas(moving, reference)
+        # set up output filename
+        output_file = '{moving}_IN_{descr}_{reference}-.nii.gz'.format(
+                moving=get_filebase(moving),
+                descr=transform_infix,
+                reference=get_filebase(reference))
+        output_path = os.path.join(base_folder, output_file)
+
+        return cls(comment, moving=moving, reference=reference,
+                output=output_path, transforms=command_sequence,
+                **kwargs)
+
     def __init__(self, comment='', **kwargs):
         """
-        Creates a warping command for ANTS warps.
+        Creates a warping command for ANTS warps. For a more convenient
+        interface, see make_from_registration.
 
         Parameters:
         -----------
@@ -388,7 +454,8 @@ class WarpCommand(Command):
         Keyword arguments:
         ------------------
         moving, output, reference (image filenames)
-        transforms : string of transforms as would be passed to WIMT,
+        transforms : string of transforms with spaces just as you would pass
+                     to WarpImageMultiTransform
         useNN : boolean indicating whether to use nearest-neighbor interp
         """
         self.cmd = ANTSPATH + 'WarpImageMultiTransform 3 %(moving)s %(output)s -R %(reference)s'
@@ -402,7 +469,7 @@ class WarpCommand(Command):
 class N4Command(Command):
     def __init__(self, comment='', **kwargs):
         """
-        Creates a command for N4 bias field correction.
+        Creates a command for N4 bias field correction. Assumes 3D images.
 
         Parameters:
         -----------
@@ -422,7 +489,7 @@ class N4Command(Command):
 class InputOutputShellCommand(Command):
     def __init__(self, comment='', **kwargs):
         """
-        Runs a simple command of the form <cmdName> <input> <output>
+        Runs a simple command of the form <cmdName> <input> <output> <extra_args>
 
         Parameters:
         -----------
@@ -432,33 +499,33 @@ class InputOutputShellCommand(Command):
         ------------------
         input, output : filenames
         cmdName : name of command/script (must be on PATH or fully qualified)
+        extra_args: additional command line arguments (*not* outputs)
 
         Example:
         converter = InputOutputShellCommand('/path/to/freesurfer/bin/mri_convert',
                                             input='/path/to/data/img1.mgz',
                                             output='/path/to/data/img2.nii.gz')
         """
-        self.cmd = "%(cmdName)s %(input)s %(output)s %(other)s"
-        if 'other' not in kwargs:
-            kwargs['other'] = ''
+        self.cmd = "%(cmdName)s %(input)s %(output)s %(extra_args)s"
+        if 'extra_args' not in kwargs:
+            kwargs['extra_args'] = ''
         Command.__init__(self, comment, **kwargs)
 
 class PyMatchWMCommand(Command):
     def __init__(self, comment='', **kwargs):
         """
-        Command to match white matter intensity between two images.
+        Command to match mode of white matter intensity to a reference value.
         See matchWM.py documentation for more details.
 
         Keyword arguments:
         ------------------
-        alignedInFile : input image in atlas space
-        maskFile : atlas space mask
-        inFile : input image in original space
-        wmiSrc : atlas file or a numeric string w/the average white matter intensity
+        inFile : input image
+        maskFile : mask (in same coordinates as inFile)
+        intensity : numeric string w/the average white matter intensity
         outFile: output
         """
         py = os.path.join(THIS_DIR, 'matchWM.py')
-        self.cmd = py + ' %(alignedInFile)s %(maskFile)s %(inFile)s %(wmiSrc)s %(output)s'
+        self.cmd = py + '%(inFile)s %(maskFile)s %(intensity)s %(output)s'
         Command.__init__(self, comment, **kwargs)
 
 class PyPadCommand(Command):
@@ -512,5 +579,4 @@ class MCCMatchWMCommand(MCCCommand):
         kwargs['matlabName'] = 'matchWM'
         self.cmd = self.prefix + '%(inFile)s %(maskFile)s %(intensity)s %(output)s'
         Command.__init__(self, comment, **kwargs)
-
 
