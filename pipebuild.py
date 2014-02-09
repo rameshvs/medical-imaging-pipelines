@@ -1,15 +1,18 @@
-# This module provides a general set of tools for implementing medical imaging
-# pipelines. In particular, it was used to build the registration pipeline
-# described in the paper:
-#
-# Quantification and Analysis of Large Multimodal Clinical Image Studies:
-# Application to Stroke, by Sridharan, Dalca et al.
-#
-# For questions, please contact {rameshvs,adalca}@csail.mit.edu.
+"""
+This module provides a general set of tools for implementing medical imaging
+pipelines. In particular, it was used to build the registration pipeline
+described in the paper:
+
+Quantification and Analysis of Large Multimodal Clinical Image Studies:
+Application to Stroke, by Sridharan, Dalca et al.
+
+For questions, please contact {rameshvs,adalca}@csail.mit.edu.
+"""
 
 from __future__ import print_function
 import re
 import os
+import warnings
 
 THIS_DIR = os.path.dirname(os.path.realpath(__file__))
 
@@ -31,6 +34,7 @@ QSUB_RUN =        os.path.join(THIS_DIR,'qsub-run')
 # Requires SGE to run in batch mode
 QSUB = 'qsub'
 # image type / file extension: only .nii.gz is currently supported!!
+# TODO support non-image outputs
 STANDARD_EXTENSION = '.nii.gz'
 
 
@@ -69,6 +73,41 @@ def select_non_atlas(moving, fixed):
         raise ValueError("Shouldn't have more than one atlas image in a registration")
     return os.path.dirname(non_atlas)
 
+class DatasetFile(object):
+    def __init__(self, subj, modality, feature, modifiers, extension, template):
+
+        self.subj = subj
+        self.modality = modality
+        self.feature = feature
+        self.modifiers = modifiers
+        self.template = template
+        self.extension = extension
+        self.pieces = (subj, modality, feature, modifiers, extension, template)
+
+        spec = {'subj': self.subj, 'modality': self.modality,
+                'feature': self.feature, 'extension': extension}
+        if '{modifiers}' in self.template:
+            spec['modifiers'] = self.modifiers
+
+        self.filename = self.template.format(**spec) + extension
+
+    def __eq__(self, other):
+        return type(self) == type(other) and self.pieces == other.pieces
+
+    def __hash__(self):
+        return hash(self.pieces)
+
+    def get_filebase(self):
+        """
+        Returns a file's base name without an extension:
+        e.g., takes '/foo/bar/hello.nii.gz' and returns 'hello'
+        """
+        base_ext = self.filename.split(os.path.sep)[-1]
+        return base_ext.split('.')[0]
+
+
+class DatasetMissingFileError(Exception): pass
+
 class Dataset(object):
     """
     Class representing your data. Has a range of features from simple to
@@ -85,33 +124,81 @@ class Dataset(object):
         self.original_template = original_template
         self.processing_template = processing_template
 
+        self.mandatory_files = set()
+        self.optional_files = {}
+        self.optional_inputs = set()
+        self.invalid_files = set()
+
+    def get_folder(self, subj):
+        return os.path.join(self.base, subj)
+
     def get_log_folder(self, subj):
         """
         Returns the subfolder of the subject with logs (SGE, metadata, etc)
         """
         return os.path.join(self.base, subj, 'logs')
 
-    def get_original_file(self, subj, modality, feature):
+    def get_original_file(self, subj, modality, feature, extension=STANDARD_EXTENSION):
         """
         Returns the specified file. Meant to be used for files that are inputs to the pipeline.
         """
         if feature == 'img':
             feature = 'raw'
-        #template = os.path.join(self.base , '{subj}/original/{modality}_1/{subj}_{modality}_{feature}.nii.gz')
-        spec = {'subj': subj, 'modality': modality, 'feature': feature}
+        f = DatasetFile(subj, modality, feature, None, extension, self.original_template)
 
-        return self.original_template.format(**spec)
+        ### Tracking optional/mandatory files
+        if not os.path.exists(f.filename):
+            if self.is_mandatory(f):
+                raise DatasetMissingFileError("Missing mandatory file:" + f.filename)
+            else:
+                self.invalidate_file(f)
+        if not self.is_mandatory(f):
+            self.add_optional_original(f)
 
-    def get_file(self, subj, modality, feature, modifiers=''):
+        return f
+
+    def get_file(self, subj, modality, feature, modifiers='', extension=STANDARD_EXTENSION):
         """
         Returns the specified file. Meant to be used for intermediate files in the processing
         pipeline.
         """
-        spec = {'subj': subj, 'modality': modality, 'feature': feature, 'modifiers': modifiers}
-        return self.processing_template.format(**spec)
+        f = DatasetFile(subj, modality, feature, modifiers, extension, self.processing_template)
+        return f
 
-        #template = os.path.join(self.base, '{subj}/images/{subj}_{modality}_{feature}{modifiers}.nii.gz')
+    ### Mandatory-ness is shared across all subjects, so we track tuples
+    ### rather than DatasetFile objects.
+    def is_mandatory(self, f):
+        return (f.modality, f.feature, f.extension) in self.mandatory_files
 
+    def add_mandatory_input_file(self, modality, feature, extension=STANDARD_EXTENSION):
+        """ Registers a certain file as mandatory """
+        self.mandatory_files.add((modality, feature, extension))
+
+    def add_optional_original(self, f):
+        self.optional_inputs.add((f.modality, f.feature, f.extension))
+
+    ### Invalid-ness is done on a per-subject basis, so track DatasetFile objects
+    def is_invalid(self, f):
+        """ Checks if a DatasetFile is invalid: future commands using it won't run. """
+        return f in self.invalid_files
+    def invalidate_file(self, f):
+        """ Invalidates a DatasetFile: future commands using it won't run. """
+        self.invalid_files.add(f)
+
+    def invalidate_command_outputs(self, command):
+        """
+        Invalidates all of a Command's outputs (DatasetFiles) so that future
+        commands that depend on them won't run.
+        """
+        for outp in command.outfiles:
+            self.invalidate_file(outp)
+
+    def check_command_input_validity(self, command):
+        """ Checks if any inputs to command have been invalidated """
+        for inp in command.inputs:
+            if type(inp) is DatasetFile and self.is_invalid(inp):
+                return False
+        return True
 
 class Atlas(object):
     """
@@ -119,7 +206,7 @@ class Atlas(object):
     easily track and get files in atlas space.
     """
 
-    suffixes = {'img': '.nii.gz'}
+    suffixes = {'img': STANDARD_EXTENSION}
 
     def __init__(self, atlas_subj, atlas_location):
         self.atlas_subj = atlas_subj
@@ -131,14 +218,19 @@ class Atlas(object):
 
     def get_file(self, name):
         """ Returns the filename for some registered file. """
-        return os.path.join(self.atlas_location,
+        return AtlasFile(os.path.join(self.atlas_location,
                             '{atlas_subj}{suffix}'.format(
-                                suffix=self.suffixes[name], atlas_subj=self.atlas_subj))
+                                suffix=self.suffixes[name], atlas_subj=self.atlas_subj)))
 
-def modify_filename(filename, modifier):
-    """ Takes ('/a/b/foo.nii.gz', '_pad') and returns '/a/b/foo_pad.nii.gz' """
-    assert filename.endswith(STANDARD_EXTENSION)
-    return os.path.join(os.path.dirname(filename), get_filebase(filename) + modifier + STANDARD_EXTENSION)
+class AtlasFile(DatasetFile):
+    def __init__(self, filename):
+        self.filename = filename
+    def __hash__(self):
+        return hash(self.filename)
+    def __eq__(self, other):
+        return type(other) == type(self) and self.filename == other.filename
+
+
 
 ###############################################################################
 ### Commands (perform tasks, sort of like interfaces in nipype but simpler) ###
@@ -157,41 +249,60 @@ class Command(object):
     def reset(cls):
         cls.all_commands = []
     @classmethod
-    def generate_code(cls, command_file, clobber_existing_outputs=False,
+    def generate_code(cls, command_file, dataset=None, clobber_existing_outputs=False,
                       json_file=None):
         """
         Writes code to perform all created commands. Commands are run in the
         order they were created; there are no dependency-based reorderings.
 
         command_file : a file to write the commands to
-        clobber_existing_outputs: whether or not to rerun commands whose
+        dataset : a dataset object to cross-check commands against
+        clobber_existing_outputs : whether or not to rerun commands whose
         outputs already exist
         """
         # TODO incorporate dependencies
         with open(command_file, 'w') as f:
             f.write('#!/usr/bin/env bash\n')
             f.write('set -e\n\n')
-            for command in cls.all_commands: # order is very important here
+            for command in cls.all_commands: # loop in order listed
+                # TODO cleaner logic
                 if clobber_existing_outputs or not command.check_outputs():
-                    f.write('# ' + command.comment + '\n')
-                    f.write(command.cmd + '\n\n\n\n')
+                    if dataset is not None and not dataset.check_command_input_validity(command):
+                        f.write('# *** Skipping (due to missing input) ' + command.comment + '\n'*4)
+                        dataset.invalidate_command_outputs(command)
+
+                    else:
+                        f.write('# ' + command.comment + '\n')
+                        f.write(command.cmd + '\n'*4)
                 else:
-                    f.write('# *** Skipping ' + command.comment + '\n\n\n\n')
+                    f.write('# *** Skipping ' + command.comment + '\n'*4)
         os.chmod(command_file, 0775)
 
 
 
-    def __init__(self, comment='', **kwargs):
+    def __init__(self, comment, **kwargs):
         if not hasattr(self, 'outfiles'):
-            self.outfiles = [kwargs['output']]
+            if 'output' not in kwargs:
+                self.outfiles = []
+                warnings.warn("output/outfiles not specified for command; can't track output:\n"+comment,
+                        RuntimeWarning)
+            else:
+                self.outfiles = [kwargs['output']]
+
+        self.parameters = kwargs
         self.comment = comment
 
-        self.cmd = self.cmd % kwargs
+        good_kwargs = {}
+        for (k, v) in kwargs.iteritems():
+            if hasattr(v, 'filename'):
+                good_kwargs[k] = v.filename
+            else:
+                good_kwargs[k] = v
+        self.cmd = self.cmd % good_kwargs
 
         self.command_id = len(Command.all_commands)
         Command.all_commands.append(self) # order is very important here
 
-        self.parameters = kwargs
 
         # Tracking of input/output relationships between commands.
         # TODO use this to track files, etc.
@@ -205,19 +316,29 @@ class Command(object):
                 # split on non-escaped spaces (since escaped spaces could be
                 # filenames)
                 inputs.extend(re.split(r'(?<!\\)\s+', v))
+            elif hasattr(v, 'filename'):
+                inputs.append(v)
             elif type(v) is list or type(v) is tuple:
                 inputs.extend(v)
         for v in inputs:
-            if type(v) is str and has_valid_path(v):
+            if (type(v) is str and has_valid_path(v)) or \
+                    hasattr(v, 'filename'):
                 self.inputs.append(v)
 
-        # print(self.inputs)
-        # print('\n\n')
         self.inputs = set(self.inputs).difference(self.outfiles)
 
     def check_outputs(self):
         """ Checks if outputs are already there (True if they are). Warning: not thread-safe """
-        return len(filter(os.path.exists, self.outfiles)) == len(self.outfiles)
+        # TODO move to dataset
+        new_outfiles = []
+        for f in self.outfiles:
+            if hasattr(f, 'filename'):
+                new_outfiles.append(f.filename)
+            else:
+                new_outfiles.append(f)
+
+        return len(self.outfiles) > 0 and \
+                all([os.path.exists(f) for f in new_outfiles])
 
 def is_original_file(filename):
     # TODO fix this awful hack
@@ -230,7 +351,7 @@ def has_valid_path(filename):
 # Commands for using binaries that ship with ANTS #
 ###################################################
 class ANTSCommand(Command):
-    def __init__(self, comment='', **kwargs):
+    def __init__(self, comment, **kwargs):
         """
         Creates an ANTS registration command.
 
@@ -256,6 +377,9 @@ class ANTSCommand(Command):
         init : the name of an affine registration file to initialize
                from (does NOT perform further affine steps)
         radiusBins : the correlation radius (for CC) or # of bins (for MI)
+        output_folder : folder to store output with default naming
+        output_prefix : exact prefix for output files (as with ANTS's -o option)
+        (specify either output_folder OR output_prefix)
         other : a string with extra flags for ANTS that aren't listed/handled above.
 
         """
@@ -306,24 +430,28 @@ class ANTSCommand(Command):
                 kwargs['radiusBins'] = 32
 
         # Set up output name, etc
-        base_folder = select_non_atlas(kwargs['fixed'], kwargs['moving'])
-        outpath = os.path.join(os.path.dirname(base_folder),'images', 'reg')
+        if 'output_folder' in kwargs:
+            base_folder = kwargs.pop('output_folder')
+            outpath = os.path.join(base_folder, 'images', 'reg')
 
-        self.transform_infix = '%s_%s%d_%s' % \
-                (self.method_name, kwargs['metric'], kwargs['radiusBins'], mask_string)
+            self.transform_infix = '%s_%s%d_%s' % \
+                    (self.method_name, kwargs['metric'], kwargs['radiusBins'], mask_string)
 
-        # file prefix for ANTS: contains all information about the reg
-        # TODO more sophisticated tracking of parameters should happen here
-        a = '{moving}_TO_{descr}_{fixed}'.format(
-                moving=get_filebase(kwargs['moving']),
-                fixed=get_filebase(kwargs['fixed']),
-                descr=self.transform_infix)
+            # file prefix for ANTS: contains all information about the reg
+            # TODO more sophisticated tracking of parameters should happen here
+            a = '{moving}_TO_{descr}_{fixed}'.format(
+                    moving=kwargs['moving'].get_filebase(),
+                    fixed=kwargs['fixed'].get_filebase(),
+                    descr=self.transform_infix)
 
-        kwargs['output'] = self.transform_string = os.path.join(outpath, a)
+            self.output_prefix = os.path.join(outpath, a)
+        elif 'output_prefix' in kwargs:
+            self.output_prefix = kwargs.pop('output_prefix')
+        kwargs['output'] = self.output_prefix
         Command.__init__(self, comment, **kwargs)
 
         # outfiles could be EITHER aff+warp+invwarp or aff
-        self.outfiles = [self.transform_string + name for name in outfiles]
+        self.outfiles = [self.output_prefix + name for name in outfiles]
 
         # Figure out the strings for warping using this registration's output
         if len(outfiles) == 1:
@@ -331,27 +459,26 @@ class ANTSCommand(Command):
             (self.affine,) = self.outfiles
             self.forward_warp_string = ' {0} '.format(self.affine)
             self.backward_warp_string = ' -i {0} '.format(self.affine)
-            #self.forward_warp_string = ' ' + self.affine + ' '
-            #self.backward_warp_string = ' -i ' + self.affine + ' '
         elif len(outfiles) == 3:
             assert kwargs['method'] not in ('affine', 'rigid')
             # Nonlinear registration: we have Warp, InverseWarp, and Affine
             (self.affine, self.inverse_warp, self.warp) = self.outfiles
             self.forward_warp_string = ' {0} {1} '.format(self.warp, self.affine)
             self.backward_warp_string = ' -i {0} {1} '.format(self.affine, self.inverse_warp)
-            #self.forward_warp_string = ' ' + self.warp + ' ' + self.affine + ' '
-            #self.backward_warp_string = ' -i ' + self.affine + ' ' + self.inverse_warp + ' '
         else:
             raise ValueError("I expected 1 or 3 outputs from ANTS, not %d" % len(outfiles))
 
-def make_warp_kwargs(moving, reference, reg_sequence, invert_sequence):
+
+def get_warped_filename(moving, reference, reg_sequence, inversion_sequence):
     """
-    DEPRECATED. See ANTSWarpCommand.make_from_registration_sequence instead.
+    Utility function for combining ANTS registrations. See
+    `ANTSWarpCommand.make_from_registration_sequence' for more details.
     """
-    raise DeprecationWarning
+    ## Combine registrations
     transform_infix = ''
     command_sequence = ''
-    for (ants, invert) in zip(reg_sequence, invert_sequence):
+    # construct warps in the format that ANTS wants them
+    for (ants, invert) in zip(reg_sequence, inversion_sequence):
         transform_infix += ants.transform_infix
 
         if invert == 'inverse':
@@ -359,15 +486,13 @@ def make_warp_kwargs(moving, reference, reg_sequence, invert_sequence):
         elif invert == 'forward':
             warp_string = ants.forward_warp_string
         command_sequence = warp_string + command_sequence
-    base_folder = select_non_atlas(moving, reference)
-    a = '{moving}_IN_{descr}_{reference}-.nii.gz'.format(
-            moving=get_filebase(moving),
+    base_folder = select_non_atlas(moving.filename, reference.filename)
+    output_file = '{moving}_IN_{descr}_{reference}-.nii.gz'.format(
+            moving=moving.get_filebase(),
             descr=transform_infix,
-            reference=get_filebase(reference))
-            #'%(moving)s_IN_%(descr)s_%(reference)s-.nii.gz' % {'moving': get_filebase(moving),
-    output = os.path.join(base_folder,a)
-    return {'moving': moving, 'reference': reference,
-            'output': output, 'transforms': command_sequence}
+            reference=reference.get_filebase())
+    output_path = os.path.join(base_folder, output_file)
+    return (output_path, command_sequence)
 
 class ANTSWarpCommand(Command):
     """
@@ -376,6 +501,9 @@ class ANTSWarpCommand(Command):
     make_from_single_registration and make_from_registration_sequence.
     """
 
+    # Maps (moving, reference) filename pairs to warped image filenames.
+    # Warning: not reliable for pairs which have multiple warp paths!
+    warp_mapping = {}
     @classmethod
     def make_from_single_registration(cls, comment, moving, reference,
             registration, inversion='forward'):
@@ -412,37 +540,21 @@ class ANTSWarpCommand(Command):
         regB = ANTSCommand("Register 2 to 3", moving=img2, fixed=img3, ...)
 
         # To warp 1 to 3 using these registrations:
-        warp_1to3 = ANTSWarpCommand.make_from_registration(img1, img3,
-                        [regA, regB], ['forward', 'forward'])
+        warp_1to3 = ANTSWarpCommand.make_from_registration_sequence(
+                        img1, img3, [regA, regB], ['forward', 'forward'])
 
         # To warp 3 to 1 using these registrations
-        warp_3to1 = ANTSWarpCommand.make_from_registration(img3, img1,
-                        [regB, regA], ['inverse', 'inverse'])
+        warp_3to1 = ANTSWarpCommand.make_from_registration(
+                        img3, img1, [regB, regA], ['inverse', 'inverse'])
         """
-        transform_infix = ''
-        command_sequence = ''
-        # construct warps in the format that ANTS wants them
-        for (ants, invert) in zip(reg_sequence, inversion_sequence):
-            transform_infix += ants.transform_infix
-
-            if invert == 'inverse':
-                warp_string = ants.backward_warp_string
-            elif invert == 'forward':
-                warp_string = ants.forward_warp_string
-            command_sequence = warp_string + command_sequence
-        base_folder = select_non_atlas(moving, reference)
-        # set up output filename
-        output_file = '{moving}_IN_{descr}_{reference}-.nii.gz'.format(
-                moving=get_filebase(moving),
-                descr=transform_infix,
-                reference=get_filebase(reference))
-        output_path = os.path.join(base_folder, output_file)
+        (output_path, cmd_sequence) = get_warped_filename(
+                moving, reference, reg_sequence, inversion_sequence)
 
         return cls(comment, moving=moving, reference=reference,
-                output=output_path, transforms=command_sequence,
+                output=output_path, transforms=cmd_sequence,
                 **kwargs)
 
-    def __init__(self, comment='', **kwargs):
+    def __init__(self, comment, **kwargs):
         """
         Creates a warping command for ANTS warps. For a more convenient
         interface, see make_from_registration.
@@ -458,6 +570,7 @@ class ANTSWarpCommand(Command):
                      to WarpImageMultiTransform
         useNN : boolean indicating whether to use nearest-neighbor interp
         """
+        self.warp_mapping[(kwargs['moving'], kwargs['reference'])] = kwargs['output']
         self.cmd = ANTSPATH + 'WarpImageMultiTransform 3 %(moving)s %(output)s -R %(reference)s'
         self.cmd += ' ' + kwargs['transforms']
 
@@ -467,7 +580,7 @@ class ANTSWarpCommand(Command):
         Command.__init__(self, comment, **kwargs)
 
 class N4Command(Command):
-    def __init__(self, comment='', **kwargs):
+    def __init__(self, comment, **kwargs):
         """
         Creates a command for N4 bias field correction. Assumes 3D images.
 
@@ -487,7 +600,7 @@ class N4Command(Command):
 # Commands for simple scripts #
 ###############################
 class InputOutputShellCommand(Command):
-    def __init__(self, comment='', **kwargs):
+    def __init__(self, comment, **kwargs):
         """
         Runs a simple command of the form <cmdName> <input> <output> <extra_args>
 
@@ -511,8 +624,49 @@ class InputOutputShellCommand(Command):
             kwargs['extra_args'] = ''
         Command.__init__(self, comment, **kwargs)
 
+class DumpCommand(Command):
+    def __init__(self, comment, **kwargs):
+        pass
+class PyFunctionCommand(Command):
+    def __init__(self, comment, function, args, output_positions=[]):
+        """
+        Command to run a python function. Function must passed as
+        a string of the form 'module.function', and the module must
+        be on the current path.
+
+        args is a list of strings with the arguments to the function (right
+        now only strings are supported). Strings with quotes of any kind in them
+        may not work properly (untested).
+
+        output_positions is an optional list of indices into args that
+        say which ones are output files.
+
+        All of the function's parameters and all of the arguments must be
+        strings (this limitation will hopefully be removed in a future
+        version).
+        """
+        import sys
+        (module, funcname) = function.rsplit('.', 1)
+        # TODO trim this to where the module is
+        path = sys.path + [os.getcwd()]
+        self.cmd =\
+            "python -c \"import sys; sys.path.extend(%(path)s);" \
+            "import %(module)s; %(module)s.%(func)s(%(arg)s)\""
+
+        self.outfiles = [args[i] for i in output_positions]
+        newargs = []
+        for arg in args:
+            if type(arg) in [DatasetFile, AtlasFile]:
+                newargs.append(arg.filename)
+            else:
+                newargs.append(str(arg))
+        Command.__init__(self, comment, path=path, module=module, func=funcname,
+                arg=','.join(["'"+arg+"'" for arg in newargs]))
+
+
+
 class PyMatchWMCommand(Command):
-    def __init__(self, comment='', **kwargs):
+    def __init__(self, comment, **kwargs):
         """
         Command to match mode of white matter intensity to a reference value.
         See matchWM.py documentation for more details.
@@ -529,7 +683,7 @@ class PyMatchWMCommand(Command):
         Command.__init__(self, comment, **kwargs)
 
 class PyPadCommand(Command):
-    def __init__(self, comment='', **kwargs):
+    def __init__(self, comment, **kwargs):
         """
         Command to pad a nifti volume
         See matchWM.py documentation for more details.
@@ -549,33 +703,33 @@ class PyPadCommand(Command):
 ############################################
 class MCCCommand(Command): # abstract class
     prefix = os.path.join(MCC_BINARY_PATH, 'MCC_%(matlabName)s/run_%(matlabName)s.sh ') + MCR + ' '
-    def __init__(self, comment='', **kwargs):
+    def __init__(self, comment, **kwargs):
         """ Arguments: matlabName, ... """
         self.cmd = self.prefix
         raise NotImplementedError # Abstract class
 
 class MCCInputOutputCommand(MCCCommand):
-    def __init__(self, comment='', **kwargs):
+    def __init__(self, comment, **kwargs):
         """ See MCCCommand. Arguments: matlabName, input, output """
         self.cmd = (self.prefix + '%(input)s %(output)s')
         Command.__init__(self, comment, **kwargs)
 
 class MCCPadCommand(MCCCommand):
-    def __init__(self, comment='', **kwargs):
+    def __init__(self, comment, **kwargs):
         """ See MCCCommand. Arguments: input, output, out_mask """
         kwargs['matlabName'] = 'padNii'
         self.cmd = (self.prefix + '%(input)s %(output)s %(out_mask)s')
         Command.__init__(self, comment, **kwargs)
 
 class MCCHistEqCommand(MCCCommand):
-    def __init__(self, comment='', **kwargs):
+    def __init__(self, comment, **kwargs):
         """ See MCCCommand. Arguments: input, output, ref_hist. does 'cut' only """
         kwargs['matlabName'] = 'doHistogramEqualization'
         self.cmd = (self.prefix + '%(ref_hist)s %(output)s %(input)s cut')
         Command.__init__(self, comment, **kwargs)
 
 class MCCMatchWMCommand(MCCCommand):
-    def __init__(self, comment='', **kwargs):
+    def __init__(self, comment, **kwargs):
         kwargs['matlabName'] = 'matchWM'
         self.cmd = self.prefix + '%(inFile)s %(maskFile)s %(intensity)s %(output)s'
         Command.__init__(self, comment, **kwargs)
